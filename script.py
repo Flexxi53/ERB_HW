@@ -1,16 +1,19 @@
-import os
-import django
 import json
+import os
 import re
 from datetime import datetime
+from dotenv import load_dotenv
+import psycopg2
 
-# ==========================================
-# INITIALIZE DJANGO ENVIRONMENT
-# ==========================================
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
-django.setup()
-
-from pages.models import Owner, Pet, MedicalRecord
+# --- CONFIGURATION ---
+load_dotenv()
+DB_CONFIG = {
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": os.getenv("DB_PORT", "5432")
+}
 
 # --- CLEANING & FORMATTING HELPERS ---
 
@@ -39,7 +42,7 @@ def format_date(date_str):
     except ValueError:
         return datetime.today().date()
 
-# --- IMPORTERS (c. 將資料匯入到 django 資料庫) ---
+# --- DIRECT PSYCOPG2 IMPORTERS ---
 
 def import_all_data(file_path):
     print(f"Reading unified data from {file_path}...")
@@ -47,21 +50,35 @@ def import_all_data(file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
             master_data = json.load(f)
             
-        # 1. Import Owners
-        owners_raw = master_data.get('owners', [])
+        # Connect directly to PostgreSQL
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        
         owner_count = 0
-        for row in owners_raw:
+        pet_count = 0
+        med_count = 0
+
+        # Note: Replace 'pages_owner', 'pages_pet', 'pages_medicalrecord' with your actual table names (usually appname_modelname)
+        
+        # 1. Import Owners
+        for row in master_data.get('owners', []):
             name, email, phone = format_owner(
                 clean_data(row.get('name')), clean_data(row.get('email')), clean_data(row.get('phone'))
             )
-            _, created = Owner.objects.get_or_create(email=email, defaults={'name': name, 'phone': phone})
-            if created: owner_count += 1
+            # Check if email exists, else insert
+            cur.execute("SELECT id FROM pages_owner WHERE email = %s;", (email,))
+            existing = cur.fetchone()
+            if not existing:
+                cur.execute(
+                    "INSERT INTO pages_owner (name, email, phone) VALUES (%s, %s, %s);",
+                    (name, email, phone)
+                )
+                owner_count += 1
+        conn.commit()
         print(f"  -> Imported {owner_count} new Owners.")
 
         # 2. Import Pets
-        pets_raw = master_data.get('pets', [])
-        pet_count = 0
-        for row in pets_raw:
+        for row in master_data.get('pets', []):
             name = clean_data(row.get('name')).title()
             breed = clean_data(row.get('breed'))
             owner_email = clean_data(row.get('owner_email')).lower()
@@ -70,85 +87,129 @@ def import_all_data(file_path):
                 clean_data(row.get('species')), clean_data(row.get('age')), clean_data(row.get('is_vaccinated'))
             )
 
-            owner = Owner.objects.filter(email=owner_email).first()
-            if owner:
-                _, created = Pet.objects.get_or_create(
-                    name=name, owner=owner,
-                    defaults={'species': species, 'breed': breed, 'age': age, 'is_vaccinated': is_vac}
+            # Find owner ID by email
+            cur.execute("SELECT id FROM pages_owner WHERE email = %s;", (owner_email,))
+            owner_row = cur.fetchone()
+            
+            if owner_row:
+                owner_id = owner_row[0]
+                cur.execute(
+                    "SELECT id FROM pages_pet WHERE name = %s AND owner_id = %s;",
+                    (name, owner_id)
                 )
-                if created: pet_count += 1
+                if not cur.fetchone():
+                    cur.execute(
+                        "INSERT INTO pages_pet (name, species, breed, age, is_vaccinated, owner_id) VALUES (%s, %s, %s, %s, %s, %s);",
+                        (name, species, breed, age, is_vac, owner_id)
+                    )
+                    pet_count += 1
+        conn.commit()
         print(f"  -> Imported {pet_count} new Pets.")
 
         # 3. Import Medical Records
-        med_raw = master_data.get('medical_records', [])
-        med_count = 0
-        for row in med_raw:
+        for row in master_data.get('medical_records', []):
             pet_name = clean_data(row.get('pet_name')).title()
             treatment = clean_data(row.get('treatment')).title()
             vet_name = clean_data(row.get('vet_name')).title()
             notes = clean_data(row.get('notes'))
             date = format_date(clean_data(row.get('date')))
 
-            pet = Pet.objects.filter(name=pet_name).first()
-            if pet:
-                _, created = MedicalRecord.objects.get_or_create(
-                    pet=pet, treatment=treatment, date=date,
-                    defaults={'vet_name': vet_name, 'notes': notes}
+            # Find pet ID by name
+            cur.execute("SELECT id FROM pages_pet WHERE name = %s;", (pet_name,))
+            pet_row = cur.fetchone()
+            
+            if pet_row:
+                pet_id = pet_row[0]
+                cur.execute(
+                    "SELECT id FROM pages_medicalrecord WHERE pet_id = %s AND treatment = %s AND date = %s;",
+                    (pet_id, treatment, date)
                 )
-                if created: med_count += 1
+                if not cur.fetchone():
+                    cur.execute(
+                        "INSERT INTO pages_medicalrecord (pet_id, treatment, vet_name, date, notes) VALUES (%s, %s, %s, %s, %s);",
+                        (pet_id, treatment, vet_name, date, notes)
+                    )
+                    med_count += 1
+        conn.commit()
         print(f"  -> Imported {med_count} new Medical Records.")
+
+        cur.close()
+        conn.close()
 
     except FileNotFoundError:
         print(f"ERROR: {file_path} not found.")
+    except Exception as e:
+        print(f"Database Error: {e}")
 
+# --- DIRECT PSYCOPG2 EXPORTER ---
 
 def export_all_to_single_file(output_filename='exported_data.json'):
     print(f"\nExporting all database records into '{output_filename}'...")
-    
-    owners_data = [{"id": o.id, "name": o.name, "email": o.email, "phone": o.phone} for o in Owner.objects.all()]
-    
-    pets_data = [{
-        "id": p.id, "name": p.name, "species": p.species, "age": p.age, 
-        "owner_name": p.owner.name if p.owner else "None", "is_vaccinated": p.is_vaccinated
-    } for p in Pet.objects.all()]
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
 
-    med_data = [{
-        "id": m.id, "pet_name": m.pet.name, "treatment": m.treatment, 
-        "vet_name": m.vet_name, "date": str(m.date), "notes": m.notes
-    } for m in MedicalRecord.objects.all()]
+        # Fetch Owners
+        cur.execute("SELECT id, name, email, phone FROM pages_owner;")
+        owners_data = [{"id": r[0], "name": r[1], "email": r[2], "phone": r[3]} for r in cur.fetchall()]
 
-    with open(output_filename, 'w', encoding='utf-8') as f:
-        f.write("{\n")
-        
-        # 1. Owners block
-        f.write('  "owners": [\n')
-        owner_lines = [f"    {json.dumps(item)}" for item in owners_data]
-        f.write(",\n".join(owner_lines) + "\n")
-        f.write("  ]")
-        f.write(",\n\n")
-        
-        # 2. Pets block
-        f.write('  "pets": [\n')
-        pet_lines = [f"    {json.dumps(item)}" for item in pets_data]
-        f.write(",\n".join(pet_lines) + "\n")
-        f.write("  ]")
-        f.write(",\n\n")
-        
-        # 3. Medical Records block
-        f.write('  "medical_records": [\n')
-        med_lines = [f"    {json.dumps(item)}" for item in med_data]
-        f.write(",\n".join(med_lines) + "\n")
-        f.write("  ]\n")
-        f.write("}\n")
-        
-    print(f"SUCCESS: All records successfully exported to '{output_filename}'.")
+        # Fetch Pets with Owner Names
+        cur.execute("""
+            SELECT p.id, p.name, p.species, p.age, o.name, p.is_vaccinated 
+            FROM pages_pet p 
+            LEFT JOIN pages_owner o ON p.owner_id = o.id;
+        """)
+        pets_data = [{
+            "id": r[0], "name": r[1], "species": r[2], "age": r[3], 
+            "owner_name": r[4] if r[4] else "None", "is_vaccinated": r[5]
+        } for r in cur.fetchall()]
+
+        # Fetch Medical Records with Pet Names
+        cur.execute("""
+            SELECT m.id, p.name, m.treatment, m.vet_name, m.date, m.notes 
+            FROM pages_medicalrecord m 
+            JOIN pages_pet p ON m.pet_id = p.id;
+        """)
+        med_data = [{
+            "id": r[0], "pet_name": r[1], "treatment": r[2], 
+            "vet_name": r[3], "date": str(r[4]), "notes": r[5]
+        } for r in cur.fetchall()]
+
+        cur.close()
+        conn.close()
+
+        # Write to JSON file with custom layout
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            f.write("{\n")
+            
+            f.write('  "owners": [\n')
+            owner_lines = [f"    {json.dumps(item)}" for item in owners_data]
+            f.write(",\n".join(owner_lines) + "\n")
+            f.write("  ]")
+            f.write(",\n\n")
+            
+            f.write('  "pets": [\n')
+            pet_lines = [f"    {json.dumps(item)}" for item in pets_data]
+            f.write(",\n".join(pet_lines) + "\n")
+            f.write("  ]")
+            f.write(",\n\n")
+            
+            f.write('  "medical_records": [\n')
+            med_lines = [f"    {json.dumps(item)}" for item in med_data]
+            f.write(",\n".join(med_lines) + "\n")
+            f.write("  ]\n")
+            f.write("}\n")
+            
+        print(f"SUCCESS: All records successfully exported to '{output_filename}'.")
+
+    except Exception as e:
+        print(f"Export Error: {e}")
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    print("--- Starting Unified Django Data Manager ---")
+    print("--- Starting Direct Psycopg2 Data Manager ---")
     
     import_all_data('raw_data.json')
     export_all_to_single_file('exported_data.json')
 
     print("\n--- Process Complete! ---")
-    print("Log into your Django Admin Panel (http://127.0.0.1:8000/admin/) to check the results.")
